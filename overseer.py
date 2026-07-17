@@ -458,7 +458,7 @@ def run_job(gh, config, event):
             pr = repo.create_pull(
                 base=base, head=head,
                 title=f"overseer: {event['target']['title']}"[:100],
-                body=f"Closes #{number}\n\n{summary}")
+                body=f"Closes #{number}\n\n{redact(summary)}"[:65536])
             report(gh, config, repo_name, number, f"opened PR: {pr.html_url}")
         else:
             # is_pr job that ended up on a fork branch the PR doesn't use
