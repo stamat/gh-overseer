@@ -169,5 +169,42 @@ class TestRedact(unittest.TestCase):
             overseer.SECRETS.clear()
 
 
+class TestAckMessage(unittest.TestCase):
+    EVENT = {"is_pr": False, "target": {"title": "fix login"}}
+
+    def test_no_model_uses_canned_line(self):
+        self.assertIn(overseer.ack_message({}, self.EVENT), overseer.ACKS)
+
+    def test_ollama_failure_falls_back_to_canned_line(self):
+        # unroutable url → urlopen raises → canned ack, no exception
+        cfg = {"ack_model": "llama3.2", "ollama_url": "http://127.0.0.1:1"}
+        self.assertIn(overseer.ack_message(cfg, self.EVENT), overseer.ACKS)
+
+
+class TestHumanize(unittest.TestCase):
+    TEXT = "opened PR: https://github.com/o/r/pull/7"
+
+    def test_no_model_returns_text_unchanged(self):
+        self.assertEqual(overseer.humanize({}, self.TEXT), self.TEXT)
+
+    def test_ollama_failure_returns_text_unchanged(self):
+        cfg = {"ack_model": "llama3.2", "ollama_url": "http://127.0.0.1:1"}
+        self.assertEqual(
+            overseer.humanize(cfg, self.TEXT, keep=("https://github.com/o/r/pull/7",)),
+            self.TEXT)
+
+    def test_dropped_fact_rejects_rewrite(self):
+        # model reply that lost the URL → original text must post
+        cfg = {"ack_model": "m"}
+        orig, overseer.ollama = overseer.ollama, lambda c, p: "All done, boss!"
+        try:
+            self.assertEqual(
+                overseer.humanize(cfg, self.TEXT,
+                                  keep=("https://github.com/o/r/pull/7",)),
+                self.TEXT)
+        finally:
+            overseer.ollama = orig
+
+
 if __name__ == "__main__":
     unittest.main()

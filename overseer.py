@@ -16,17 +16,27 @@ context. Activity from anyone else is ignored.
 import argparse
 import json
 import os
+import random
 import re
 import signal
 import subprocess
 import tempfile
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 from github import Auth, Github
 
 MARKER = "🤖 [gh-overseer]"
+
+ACKS = [
+    "On it — taking a look now. 🤖",
+    "Picked this up, starting work. 🤖",
+    "I'm on this one. Updates to follow. 🤖",
+    "Got it — digging in. 🤖",
+    "Taking this — will report back here. 🤖",
+]
 
 SECRETS = []  # tokens scrubbed from everything we log or post (filled in main)
 
@@ -297,6 +307,58 @@ def report(gh, config, repo_name, number, body):
     gh.get_repo(repo_name).get_issue(number).create_comment(text)
 
 
+def ollama(config, prompt):
+    """One-shot generation against a local Ollama; returns stripped text, raises
+    on any failure. Callers always have a plain-text fallback."""
+    req = urllib.request.Request(
+        config.get("ollama_url", "http://localhost:11434") + "/api/generate",
+        json.dumps({"model": config["ack_model"], "stream": False,
+                    "prompt": prompt}).encode(),
+        {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=config.get("ack_timeout", 60)) as resp:
+        text = json.loads(resp.read())["response"].strip().strip('"')
+    return " ".join(text.split())
+
+
+def ack_message(config, event):
+    """Phrase the ack with a local Ollama model when `ack_model` is set;
+    any failure (not installed, model missing, slow) falls back to a canned
+    line — the ack must never block or fail the job."""
+    if not config.get("ack_model"):
+        return random.choice(ACKS)
+    kind = "PR" if event["is_pr"] else "issue"
+    try:
+        text = ollama(config, (
+            "You are a coding bot that just picked up GitHub "
+            f'{kind} "{event["target"]["title"]}" and are starting work on it. '
+            "Write one short, friendly, casual sentence saying so. "
+            "Reply with the sentence only — no quotes, no preamble."))
+        if text:
+            return "🤖 " + text[:300]
+    except Exception as e:
+        log(f"ack_model {config['ack_model']} failed ({e}); using canned ack")
+    return random.choice(ACKS)
+
+
+def humanize(config, text, keep=()):
+    """Rephrase a success status line via Ollama when `ack_model` is set.
+    Every fact in `keep` must survive verbatim or the original text posts —
+    never trade a URL or an instruction for tone. Error/limit messages are
+    deliberately never routed through here."""
+    if not config.get("ack_model"):
+        return text
+    try:
+        out = ollama(config, (
+            "Rephrase this GitHub bot status comment as one short, friendly, "
+            "casual sentence. Keep every URL, number and name exactly as "
+            f"written. Reply with the sentence only:\n\n{text}"))
+        if out and all(k in out for k in keep):
+            return out[:500]
+    except Exception as e:
+        log(f"ack_model {config['ack_model']} failed ({e}); posting plain text")
+    return text
+
+
 def pick_runner(config, event, owner):
     """Resolve a named runner from `run_agent: <name>` lines in owner text.
 
@@ -415,7 +477,7 @@ def run_job(gh, config, event):
 
     log(f"job start: {repo_name}#{number} ({event['kind']})")
     runner = pick_runner(config, event, config["owner"])  # before clone: typo fails fast
-    report(gh, config, repo_name, number, "🤖 agent has picked up this task and is working on it.")
+    report(gh, config, repo_name, number, ack_message(config, event))
     with tempfile.TemporaryDirectory() as tmp:
         sh(["git", "clone", "--depth", "50", auth_url(config, repo_name), tmp])
         sh(["git", "config", "user.name", config["bot_login"]], cwd=tmp)
@@ -510,13 +572,17 @@ def run_job(gh, config, event):
         existing = list(repo.get_pulls(state="open", head=head))
         if existing:
             report(gh, config, repo_name, number,
-                   f"pushed {commits} commit(s) to {existing[0].html_url}\n\n{summary}")
+                   humanize(config,
+                            f"pushed {commits} commit(s) to {existing[0].html_url}",
+                            keep=(existing[0].html_url,)) + f"\n\n{summary}")
         elif not event["is_pr"]:
             pr = repo.create_pull(
                 base=base, head=head,
                 title=f"overseer: {event['target']['title']}"[:100],
                 body=f"Closes #{number}\n\n{redact(summary)}"[:65536])
-            report(gh, config, repo_name, number, f"opened PR: {pr.html_url}")
+            report(gh, config, repo_name, number,
+                   humanize(config, f"opened PR: {pr.html_url}",
+                            keep=(pr.html_url,)))
         else:
             # is_pr job that ended up on a fork branch the PR doesn't use
             # (e.g. 403 fallback on an owner-authored PR) — say where the work is
@@ -605,6 +671,13 @@ def main():
     else:
         state = {"last_poll": utcnow(), "processed": []}
     log(f"gh-overseer as @{config['bot_login']}, owner @{config['owner']}")
+    if config.get("ack_model"):  # informational only — each call falls back anyway
+        url = config.get("ollama_url", "http://localhost:11434")
+        try:
+            urllib.request.urlopen(url, timeout=3)
+            log(f"ollama up at {url}; comments phrased by {config['ack_model']}")
+        except Exception:
+            log(f"ack_model set but no Ollama at {url} — plain comments until it's up")
     while True:
         try:
             cycle(gh, config, state, state_path)

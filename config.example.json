@@ -6,6 +6,7 @@
   "job_timeout": 3600,
   "retry_delay": 18600,
   "context_limit": 50,
+  "ack_model": "",
   "runners": {
     "claude": ["claude", "-p", "{prompt}",
                "--model", "claude-opus-4-8",
