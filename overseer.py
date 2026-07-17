@@ -146,7 +146,9 @@ def build_prompt(event, owner, limit=50):
         "- Do NOT push; the orchestrator pushes.\n"
         f"- If you need more information from @{owner}, make NO code changes and"
         " end with your question — it will be posted as a comment.\n"
-        "- Finish with a short summary of what you did and why."
+        "- Write your full report — what you did and why, or the full answer if"
+        " a report/analysis was requested — to `.overseer-report.md` in the repo"
+        " root. It is posted back as a comment and never committed."
     )
     return "\n\n".join(parts)
 
@@ -287,8 +289,11 @@ def enrich(gh, event):
 # ---------------------------------------------------------------- job runner
 
 def report(gh, config, repo_name, number, body):
-    gh.get_repo(repo_name).get_issue(number).create_comment(
-        f"{MARKER} @{config['owner']} {redact(body)}")
+    # GitHub caps comments at 65536 chars; keep the head, note the cut
+    text = f"{MARKER} @{config['owner']} {redact(body)}"
+    if len(text) > 65536:
+        text = text[:65400] + "\n\n…(truncated)"
+    gh.get_repo(repo_name).get_issue(number).create_comment(text)
 
 
 def run_agent(config, prompt, cwd):
@@ -386,9 +391,12 @@ def run_job(gh, config, event):
         start_ref = sh(["git", "rev-parse", "HEAD"], cwd=tmp).strip()
 
         resume_at = None
+        report_md = Path(tmp) / ".overseer-report.md"
         try:
             summary = run_agent(config, build_prompt(event, config["owner"],
                                                      config.get("context_limit", 50)), tmp)
+            if report_md.exists():  # full report beats truncated stdout
+                summary = report_md.read_text().strip() or summary
         except UsageLimit as e:
             resume_at = e.resume_at or time.time() + config.get("retry_delay", 3600)
             when = datetime.fromtimestamp(resume_at, timezone.utc).strftime("%H:%M UTC")
@@ -399,6 +407,7 @@ def run_job(gh, config, event):
             # follow-up comment resumes from the pushed commits.
             summary = (f"⚠️ {e} — pushed any partial work. "
                        "Reply here to resume from where it stopped.")
+        report_md.unlink(missing_ok=True)  # never commit the report file
 
         # commit anything the agent left uncommitted, then count work
         subprocess.run(["git", "add", "-A"], cwd=tmp, capture_output=True)
