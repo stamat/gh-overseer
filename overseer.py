@@ -73,9 +73,10 @@ class AgentTimeout(RuntimeError):
 class UsageLimit(RuntimeError):
     """Agent hit a usage/rate limit; resume_at is an epoch timestamp or None."""
 
-    def __init__(self, msg, resume_at=None):
+    def __init__(self, msg, resume_at=None, usage=""):
         super().__init__(msg)
         self.resume_at = resume_at
+        self.usage = usage
 
 
 # ---------------------------------------------------------------- pure logic
@@ -296,6 +297,21 @@ def report(gh, config, repo_name, number, body):
     gh.get_repo(repo_name).get_issue(number).create_comment(text)
 
 
+def usage_line(data):
+    """Cost/token footer from a claude --output-format json result dict."""
+    u = data.get("usage") or {}
+    if not u:
+        return ""
+    inp = sum(u.get(k, 0) for k in ("input_tokens", "cache_creation_input_tokens",
+                                    "cache_read_input_tokens"))
+    cost = data.get("total_cost_usd")
+    return ("\n\n`"
+            + (f"${cost:.2f} · " if cost is not None else "")
+            + f"{data.get('num_turns', '?')} turns · {inp:,} in "
+            + f"({u.get('cache_read_input_tokens', 0):,} cached) · "
+            + f"{u.get('output_tokens', 0):,} out`")
+
+
 def run_agent(config, prompt, cwd):
     runner = config.get("runner", DEFAULT_RUNNER)
     allowed = config.get("allowed_tools", "Read,Edit,Write,Grep,Glob,Bash(git:*)")
@@ -314,22 +330,30 @@ def run_agent(config, prompt, cwd):
         os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
         raise AgentTimeout(f"agent timed out after {timeout}s and was killed")
-    if proc.returncode != 0:
-        err = f"{stderr}\n{stdout}".strip()
-        if "usage limit" in err.lower() or "rate limit" in err.lower():
+    data = {}
+    try:  # claude --output-format json; other runners fall through to raw text
+        parsed = json.loads(stdout.strip())
+        if isinstance(parsed, dict):
+            data = parsed
+    except json.JSONDecodeError:
+        pass
+    usage = usage_line(data)
+    if proc.returncode != 0 or data.get("is_error"):
+        err = (data.get("result") or f"{stderr}\n{stdout}").strip()
+        low = err.lower()
+        if "spend limit" in low:
+            # monthly spend limit — no reset window to wait for; the owner
+            # must raise it at claude.ai, then reply here to resume
+            raise RuntimeError(f"agent stopped: {err[:200]}{usage}")
+        if (data.get("api_error_status") == 429
+                or "usage limit" in low or "rate limit" in low):
             # claude's limit message sometimes carries the reset epoch
             m = re.search(r"\b(1[6-9]\d{8})\b", err)
             raise UsageLimit(f"usage limit reached: {err[:200]}",
-                             int(m.group(1)) if m else None)
+                             int(m.group(1)) if m else None, usage)
         raise RuntimeError(f"agent exited {proc.returncode}: {err[:500]}")
-    out = stdout.strip()
-    try:  # claude --output-format json; other runners fall through to raw text
-        data = json.loads(out)
-        if isinstance(data, dict) and data.get("result"):
-            out = data["result"]
-    except json.JSONDecodeError:
-        pass
-    return out.strip()[-2000:] or "(no output)"
+    out = data.get("result") or stdout.strip()
+    return (out.strip()[-2000:] or "(no output)"), usage
 
 
 def auth_url(config, repo_name):
@@ -393,14 +417,17 @@ def run_job(gh, config, event):
         resume_at = None
         report_md = Path(tmp) / ".overseer-report.md"
         try:
-            summary = run_agent(config, build_prompt(event, config["owner"],
-                                                     config.get("context_limit", 50)), tmp)
+            summary, usage = run_agent(config, build_prompt(event, config["owner"],
+                                                            config.get("context_limit", 50)), tmp)
             if report_md.exists():  # full report beats truncated stdout
                 summary = report_md.read_text().strip() or summary
+            summary += usage
         except UsageLimit as e:
-            resume_at = e.resume_at or time.time() + config.get("retry_delay", 3600)
+            # default: 5h session window + margin, when the error has no epoch
+            resume_at = e.resume_at or time.time() + config.get("retry_delay", 18600)
             when = datetime.fromtimestamp(resume_at, timezone.utc).strftime("%H:%M UTC")
-            summary = f"⚠️ {e} — pushed any partial work; auto-resuming around {when}."
+            summary = (f"⚠️ {e} — pushed any partial work; "
+                       f"auto-resuming around {when}.{e.usage}")
         except (AgentTimeout, RuntimeError) as e:
             # salvage: agent died (timeout, crash) — push whatever subtasks were
             # committed. Branch + issue thread are the durable state; a

@@ -55,8 +55,10 @@ login).
 
 - agent hangs → killed at `job_timeout` (with all child processes),
   committed subtasks still pushed
-- usage/rate limit → partial work pushed, job auto-resumes when the limit
-  window resets (max 5 attempts)
+- usage/rate limit (5h session, weekly) → partial work pushed, job
+  auto-resumes when the limit window resets (max 5 attempts)
+- monthly spend limit → partial work pushed, no auto-retry (nothing resets
+  until you raise the limit at claude.ai); reply on the thread to resume
 - push fails (no access, network) → commits preserved locally as a git
   bundle in `salvage/`; the next job for that issue restores them and
   continues — no agent work is ever lost
@@ -97,7 +99,7 @@ export GH_BOT_TOKEN=github_pat_...   # or put it in config.json as bot_token
 | `poll_interval` | seconds between polls (default 60)                                                                                                                                                                                                                      |
 | `allowed_tools` | substituted for `{allowed_tools}` in the runner                                                                                                                                                                                                         |
 | `job_timeout`   | max seconds per job (default 3600). A hung agent is killed (with everything it spawned); subtasks committed before the kill are still pushed and the timeout is reported in the comment                                                                 |
-| `retry_delay`   | seconds before auto-resuming a job that hit a usage/rate limit (default 3600), used when the limit error doesn't carry a reset time. Partial work is pushed, the job re-queues itself (max 5 attempts), and the resume picks up from the pushed commits |
+| `retry_delay`   | seconds before auto-resuming a job that hit a usage/rate limit (default 18600 = 5h10m, past the 5h session window), used when the limit error doesn't carry a reset time. Partial work is pushed, the job re-queues itself (max 5 attempts), and the resume picks up from the pushed commits. Monthly spend limit is never retried — raise it and reply to resume |
 | `context_limit` | how many of the most recent thread comments (and inline review comments) go into the agent's prompt (default 50)                                                                                                                                        |
 | `salvage_dir`   | where unpushable work is preserved as git bundles (default `salvage/` next to the script)                                                                                                                                                               |
 | `runner`        | agent command; `{prompt}` and `{allowed_tools}` are substituted. Use an **absolute path** to the binary (e.g. `/Users/you/.local/bin/claude`) — service environments (launchd, cron) run with a minimal `PATH` that usually lacks `~/.local/bin`                                                                                                                                                                                         |
