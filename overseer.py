@@ -297,6 +297,34 @@ def report(gh, config, repo_name, number, body):
     gh.get_repo(repo_name).get_issue(number).create_comment(text)
 
 
+def pick_runner(config, event, owner):
+    """Resolve a named runner from `run_agent: <name>` lines in owner text.
+
+    Scans the issue/PR body, owner-authored thread comments, and the latest
+    directives (oldest first) — the last line found wins, so the owner can
+    switch runners mid-thread. No line → the first entry in `runners`
+    (None when there is no map; caller falls back to `runner`). Unknown
+    names raise, so a typo fails fast with the configured names in the
+    comment.
+    """
+    runners = config.get("runners", {})
+    texts = [event.get("target", {}).get("body") or ""]
+    texts += [c["body"] or "" for c in event.get("thread", ())
+              if c["author"] == owner]
+    texts += [d or "" for d in event.get("directives", ())]
+    name = None
+    for t in texts:
+        for m in re.finditer(r"^\s*(?:-\s+)?run_agent:\s*([\w.-]+)\s*$",
+                             t, re.M | re.I):
+            name = m.group(1)
+    if not name:
+        return next(iter(runners.values()), None)
+    if name not in runners:
+        raise RuntimeError(f"unknown runner {name!r} — configured: "
+                           f"{', '.join(sorted(runners)) or '(none)'}")
+    return runners[name]
+
+
 def usage_line(data):
     """Cost/token footer from a claude --output-format json result dict."""
     u = data.get("usage") or {}
@@ -312,8 +340,8 @@ def usage_line(data):
             + f"{u.get('output_tokens', 0):,} out`")
 
 
-def run_agent(config, prompt, cwd):
-    runner = config.get("runner", DEFAULT_RUNNER)
+def run_agent(config, prompt, cwd, runner=None):
+    runner = runner or config.get("runner", DEFAULT_RUNNER)
     allowed = config.get("allowed_tools", "Read,Edit,Write,Grep,Glob,Bash(git:*)")
     cmd = [a.replace("{prompt}", prompt).replace("{allowed_tools}", allowed)
            for a in runner]
@@ -386,6 +414,7 @@ def run_job(gh, config, event):
             log(f"no push access to {repo_name}; contributing via fork {push_repo}")
 
     log(f"job start: {repo_name}#{number} ({event['kind']})")
+    runner = pick_runner(config, event, config["owner"])  # before clone: typo fails fast
     report(gh, config, repo_name, number, "🤖 agent has picked up this task and is working on it.")
     with tempfile.TemporaryDirectory() as tmp:
         sh(["git", "clone", "--depth", "50", auth_url(config, repo_name), tmp])
@@ -418,7 +447,8 @@ def run_job(gh, config, event):
         report_md = Path(tmp) / ".overseer-report.md"
         try:
             summary, usage = run_agent(config, build_prompt(event, config["owner"],
-                                                            config.get("context_limit", 50)), tmp)
+                                                            config.get("context_limit", 50)),
+                                       tmp, runner)
             if report_md.exists():  # full report beats truncated stdout
                 summary = report_md.read_text().strip() or summary
             summary += usage

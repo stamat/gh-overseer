@@ -7,7 +7,7 @@
 import unittest
 
 import overseer
-from overseer import build_prompt, find_events
+from overseer import build_prompt, find_events, pick_runner
 
 OWNER, BOT = "stamat", "stamat-bot"
 
@@ -108,6 +108,54 @@ class TestBuildPrompt(unittest.TestCase):
             {"author": OWNER, "path": "a.py", "line": 3, "body": "rename this"}]), OWNER)
         self.assertIn("PR #1", p)
         self.assertIn("a.py:3: rename this", p)
+
+
+class TestPickRunner(unittest.TestCase):
+    CONFIG = {"runners": {"claude": ["claude"], "mini": ["mini"]}}
+
+    def event(self, body="", thread=(), directives=()):
+        return {"target": {"body": body}, "thread": list(thread),
+                "directives": list(directives)}
+
+    def pick(self, **kw):
+        return pick_runner(self.CONFIG, self.event(**kw), OWNER)
+
+    def test_no_line_picks_first_runner(self):
+        self.assertEqual(self.pick(body="do stuff", directives=["more stuff"]),
+                         ["claude"])
+
+    def test_no_line_no_runners_map_returns_none(self):
+        self.assertIsNone(pick_runner({}, self.event(body="do stuff"), OWNER))
+
+    def test_line_in_body(self):
+        self.assertEqual(self.pick(body="fix it\n\nrun_agent: mini"), ["mini"])
+
+    def test_last_line_wins_across_thread(self):
+        self.assertEqual(self.pick(
+            body="run_agent: mini",
+            thread=[{"author": OWNER, "body": "run_agent: claude"}]), ["claude"])
+
+    def test_non_owner_thread_comment_ignored(self):
+        self.assertEqual(self.pick(
+            thread=[{"author": "stranger", "body": "run_agent: mini"}]), ["claude"])
+
+    def test_unknown_name_raises_with_configured_list(self):
+        with self.assertRaisesRegex(RuntimeError, "calude.*claude, mini"):
+            self.pick(directives=["run_agent: calude"])
+
+    def test_mid_prose_mention_ignored(self):
+        self.assertEqual(self.pick(body="we could run_agent: mini someday"),
+                         ["claude"])
+
+    def test_trailing_text_ignored(self):
+        self.assertEqual(self.pick(body="run_agent: mini please"), ["claude"])
+
+    def test_own_line_in_multiline_body_matches(self):
+        self.assertEqual(self.pick(body="fix the bug\nrun_agent: mini\nthanks"),
+                         ["mini"])
+
+    def test_list_item_form_matches(self):
+        self.assertEqual(self.pick(body="- run_agent: mini"), ["mini"])
 
 
 class TestRedact(unittest.TestCase):

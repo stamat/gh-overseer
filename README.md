@@ -102,7 +102,8 @@ export GH_BOT_TOKEN=github_pat_...   # or put it in config.json as bot_token
 | `retry_delay`   | seconds before auto-resuming a job that hit a usage/rate limit (default 18600 = 5h10m, past the 5h session window), used when the limit error doesn't carry a reset time. Partial work is pushed, the job re-queues itself (max 5 attempts), and the resume picks up from the pushed commits. Monthly spend limit is never retried — raise it and reply to resume |
 | `context_limit` | how many of the most recent thread comments (and inline review comments) go into the agent's prompt (default 50)                                                                                                                                        |
 | `salvage_dir`   | where unpushable work is preserved as git bundles (default `salvage/` next to the script)                                                                                                                                                               |
-| `runner`        | agent command; `{prompt}` and `{allowed_tools}` are substituted. Use an **absolute path** to the binary (e.g. `/Users/you/.local/bin/claude`) — service environments (launchd, cron) run with a minimal `PATH` that usually lacks `~/.local/bin`                                                                                                                                                                                         |
+| `runners`       | named runner commands; `{prompt}` and `{allowed_tools}` are substituted. Use an **absolute path** to the binary (e.g. `/Users/you/.local/bin/claude`) — service environments (launchd, cron) run with a minimal `PATH` that usually lacks `~/.local/bin`. Pick one per thread with a `run_agent: <name>` line in the issue body or any of your comments — the last such line in the thread wins, so you can switch mid-thread. No line → the **first** entry. Unknown name → the job fails fast with the configured names in the comment |
+| `runner`        | single-command form (same template rules), used when `runners` is absent                                                                                                                                                                                 |
 | `env`           | extra env vars for the runner; empty values are ignored                                                                                                                                                                                                 |
 
 The bot's login is derived from the token — no need to configure it.
@@ -279,6 +280,36 @@ the checkout; `{prompt}` is substituted. Anything that takes a task, edits
 files, and commits works (e.g. [mini-swe-agent](https://github.com/SWE-agent/mini-swe-agent),
 [aider](https://aider.chat/) `aider --message "{prompt}" --yes`, or your own
 LiteLLM tool-loop script.)
+
+In fact it doesn't have to be an agent at all — any command works. It runs
+in a fresh clone of the repo; whatever it commits gets pushed and PR'd, its
+stdout (or a `.overseer-report.md` it writes) is posted back as a comment.
+A build script, a linter, `sh -c 'ruff check . > .overseer-report.md'` —
+if it runs in a checkout, it can be a runner.
+
+**3. Keep several, pick per thread** — declare named commands under
+`runners` and choose one from GitHub with a `run_agent: <name>` line:
+
+```json
+"runners": {
+  "claude": ["claude", "-p", "{prompt}", "--output-format", "json", "--permission-mode", "acceptEdits", "--allowed-tools", "{allowed_tools}"],
+  "mini":   ["uvx", "--with", "fastapi", "--with", "orjson", "mini-swe-agent", "-t", "{prompt}", "-y", "--exit-immediately", "--cost-limit", "0"]
+}
+```
+
+Then in the issue body or a follow-up comment:
+
+```
+Refactor the settings loader.
+
+run_agent: mini
+```
+
+The line must stand alone — nothing else on it (a `- run_agent: mini` list
+item also works). The last `run_agent:` line in the thread wins (issue
+body, then your comments in order), so `run_agent: claude` in a later
+comment switches the thread back. Without a line, the first entry in
+`runners` is used — order your favorite first.
 
 ### mini-swe-agent with DeepSeek
 
