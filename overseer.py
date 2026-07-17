@@ -395,11 +395,43 @@ def run_job(gh, config, event):
                 break
             time.sleep(5 * (attempt + 1))
         else:
+            # git push failed. If it was a 403 (no write access) and we
+            # weren't already targeting a fork, try creating a fork instead.
+            if "403" in pushed.stderr and push_repo == repo_name:
+                log(f"no push access to {repo_name}; attempting to contribute via fork")
+                try:
+                    push_repo = repo.create_fork().full_name
+                    push_url = auth_url(config, push_repo)
+                    log(f"pushing to fork {push_repo}")
+                    pushed = subprocess.run(
+                        ["git", "push", push_url, f"{branch}:{branch}"],
+                        cwd=tmp, capture_output=True, text=True)
+                    if pushed.returncode == 0:
+                        bundle.unlink(missing_ok=True)
+                        # wire up head for the fork path, then proceed to PR normally
+                        head = f"{push_repo.split('/')[0]}:{branch}"
+                        existing = list(repo.get_pulls(state="open", head=head))
+                        if existing:
+                            report(gh, config, repo_name, number,
+                                   f"pushed {commits} commit(s) to {existing[0].html_url}\n\n{summary}")
+                        elif not event["is_pr"]:
+                            pr = repo.create_pull(
+                                base=base, head=head,
+                                title=f"overseer: {event['target']['title']}"[:100],
+                                body=f"Closes #{number}\n\n{summary}")
+                            report(gh, config, repo_name, number,
+                                   f"opened PR: {pr.html_url}")
+                        log(f"job done: {repo_name}#{number}")
+                        return resume_at
+                except Exception as fork_err:
+                    log(f"fork-and-push failed: {fork_err}")
+
             # preserve the commits locally so the next run resumes from them
             bundle.parent.mkdir(exist_ok=True)
             sh(["git", "bundle", "create", str(bundle), branch], cwd=tmp)
+            err_msg = pushed.stderr.strip()[:300]
             raise RuntimeError(
-                f"push to {push_repo} failed: {pushed.stderr.strip()[:300]} — "
+                f"push to {push_repo} failed: {err_msg} — "
                 f"work preserved in {bundle.name}; fix access and re-trigger "
                 "with a comment to resume")
 
