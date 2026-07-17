@@ -31,7 +31,12 @@ follow-ups.
   is created automatically on first use and reused afterwards; you never
   manage it. Requires a classic PAT (see Requirements).
 
-**4. Agent runs.** Claude Code headless (or any runner you configure) works
+  If a direct push unexpectedly fails with a 403 (access revoked mid-job,
+  stale permission check), the bot falls back to the same fork flow on the
+  spot before giving up and salvaging.
+
+**4. Agent runs.** The bot comments on the issue that it has picked up the
+task, then Claude Code headless (or any runner you configure) works
 in the checkout: splits the task into subtasks, commits each separately, runs
 tests. It never pushes; the orchestrator does.
 
@@ -95,7 +100,7 @@ export GH_BOT_TOKEN=github_pat_...   # or put it in config.json as bot_token
 | `retry_delay`   | seconds before auto-resuming a job that hit a usage/rate limit (default 3600), used when the limit error doesn't carry a reset time. Partial work is pushed, the job re-queues itself (max 5 attempts), and the resume picks up from the pushed commits |
 | `context_limit` | how many of the most recent thread comments (and inline review comments) go into the agent's prompt (default 50)                                                                                                                                        |
 | `salvage_dir`   | where unpushable work is preserved as git bundles (default `salvage/` next to the script)                                                                                                                                                               |
-| `runner`        | agent command; `{prompt}` and `{allowed_tools}` are substituted                                                                                                                                                                                         |
+| `runner`        | agent command; `{prompt}` and `{allowed_tools}` are substituted. Use an **absolute path** to the binary (e.g. `/Users/you/.local/bin/claude`) — service environments (launchd, cron) run with a minimal `PATH` that usually lacks `~/.local/bin`                                                                                                                                                                                         |
 | `env`           | extra env vars for the runner; empty values are ignored                                                                                                                                                                                                 |
 
 The bot's login is derived from the token — no need to configure it.
@@ -135,6 +140,7 @@ Place `~/Library/LaunchAgents/info.stamat.gh-overseer.plist`:
   </array>
   <key>EnvironmentVariables</key><dict>
     <key>GH_BOT_TOKEN</key><string>github_pat_...</string>
+    <key>PATH</key><string>/Users/stamat/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -168,7 +174,7 @@ at `/Library/LaunchDaemons/info.stamat.gh-overseer.plist`:
   <key>EnvironmentVariables</key><dict>
     <key>GH_BOT_TOKEN</key><string>github_pat_...</string>
     <key>HOME</key><string>/Users/stamat</string>
-    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>PATH</key><string>/Users/stamat/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
   </dict>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
@@ -187,6 +193,14 @@ sudo launchctl load /Library/LaunchDaemons/info.stamat.gh-overseer.plist
 Replace `your_user` with your macOS username and `github_pat_...` with the
 actual token. The extra `HOME` and `PATH` variables are required because
 LaunchDaemons run in a minimal environment.
+
+> **LaunchDaemon + Claude Code auth:** LaunchDaemons run _outside_ your GUI
+> session and cannot read the login Keychain, where Claude Code stores its
+> credentials — jobs fail with `Not logged in · Please run /login` even
+> though `claude` works in your terminal. Fix: generate a long-lived token
+> with `claude setup-token` and pass it to the runner via config `env`:
+> `"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat…"`. LaunchAgents don't have this
+> problem (they run in your session), but stop on logout.
 
 | Feature              | LaunchAgent         | LaunchDaemon     |
 | -------------------- | ------------------- | ---------------- |
