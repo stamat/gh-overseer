@@ -1,0 +1,5 @@
+config.json
+state.json
+__pycache__/
+.venv/
+salvage/

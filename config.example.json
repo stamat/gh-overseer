@@ -1,0 +1,19 @@
+{
+  "owner": "stamat",
+  "bot_token": "",
+  "poll_interval": 60,
+  "allowed_tools": "Read,Edit,Write,Grep,Glob,Bash(git:*)",
+  "job_timeout": 3600,
+  "retry_delay": 3600,
+  "context_limit": 50,
+  "runner": ["claude", "-p", "{prompt}",
+             "--model", "claude-opus-4-8",
+             "--effort", "xhigh",
+             "--output-format", "json",
+             "--permission-mode", "acceptEdits",
+             "--allowed-tools", "{allowed_tools}"],
+  "env": {
+    "ANTHROPIC_BASE_URL": "",
+    "ANTHROPIC_MODEL": ""
+  }
+}
