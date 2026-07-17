@@ -339,6 +339,7 @@ def run_job(gh, config, event):
             log(f"no push access to {repo_name}; contributing via fork {push_repo}")
 
     log(f"job start: {repo_name}#{number} ({event['kind']})")
+    report(gh, config, repo_name, number, "🤖 agent has picked up this task and is working on it.")
     with tempfile.TemporaryDirectory() as tmp:
         sh(["git", "clone", "--depth", "50", auth_url(config, repo_name), tmp])
         sh(["git", "config", "user.name", config["bot_login"]], cwd=tmp)
