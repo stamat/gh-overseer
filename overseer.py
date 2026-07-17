@@ -28,6 +28,14 @@ from github import Auth, Github
 
 MARKER = "🤖 [gh-overseer]"
 
+SECRETS = []  # tokens scrubbed from everything we log or post (filled in main)
+
+
+def redact(s):
+    for secret in SECRETS:
+        s = s.replace(secret, "***")
+    return s
+
 DEFAULT_RUNNER = ["claude", "-p", "{prompt}",
                   "--model", "claude-opus-4-8",
                   "--effort", "xhigh",
@@ -37,7 +45,8 @@ DEFAULT_RUNNER = ["claude", "-p", "{prompt}",
 
 
 def log(msg):
-    print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {msg}", flush=True)
+    print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} "
+          f"{redact(str(msg))}", flush=True)
 
 
 def utcnow():
@@ -132,7 +141,8 @@ def build_prompt(event, owner, limit=50):
         "Instructions:\n"
         "- Break the work into subtasks.\n"
         "- Implement each subtask and commit it separately: `subtask: <description>`.\n"
-        "- Run the project's tests if present; fix any failures you introduced.\n"
+        "- Run the project's tests if present and your tools allow it;"
+        " fix any failures you introduced.\n"
         "- Do NOT push; the orchestrator pushes.\n"
         f"- If you need more information from @{owner}, make NO code changes and"
         " end with your question — it will be posted as a comment.\n"
@@ -151,6 +161,7 @@ def poll(gh, config, since):
     """
     bot, owner = config["bot_login"], config["owner"]
     me = gh.get_user()
+    ok = True  # False = a time-windowed fetch failed; caller must not advance last_poll
 
     # accept owner's collaborator invites — must be a collaborator to be
     # assignable. Needs a classic PAT (repo scope); fine-grained PATs can only
@@ -202,6 +213,7 @@ def poll(gh, config, since):
         for i in gh.search_issues(f"is:pull-request is:open author:{bot}"):
             bot_prs[(i.repository.full_name, i.number)] = i
     except Exception as e:
+        ok = False  # unknown bot PRs → their comments would be lost this window
         log(f"PR search failed: {e}")
 
     comments = []
@@ -236,6 +248,7 @@ def poll(gh, config, since):
                                      "number": number, "author": rc.user.login,
                                      "body": rc.body, "is_pr": True})
         except Exception as e:
+            ok = False  # comments in this window would be lost if last_poll advances
             log(f"poll failed for {repo_name}: {e}")
 
     # owner reviews (approve / request changes) on bot PRs.
@@ -249,9 +262,11 @@ def poll(gh, config, since):
                                      "number": number, "author": r.user.login,
                                      "body": body, "is_pr": True})
         except Exception as e:
+            # reviews are re-fetched every cycle (no since filter), so a
+            # failure here loses nothing — don't hold last_poll back for it
             log(f"review poll failed for {repo_name}#{number}: {e}")
 
-    return issues, comments
+    return issues, comments, ok
 
 
 def enrich(gh, event):
@@ -273,7 +288,7 @@ def enrich(gh, event):
 
 def report(gh, config, repo_name, number, body):
     gh.get_repo(repo_name).get_issue(number).create_comment(
-        f"{MARKER} @{config['owner']} {body}")
+        f"{MARKER} @{config['owner']} {redact(body)}")
 
 
 def run_agent(config, prompt, cwd):
@@ -329,6 +344,9 @@ def run_job(gh, config, event):
     # (create_fork is idempotent — returns the existing fork if there is one)
     if event["is_pr"]:
         pr = repo.get_pull(number)
+        if pr.head.repo is None:
+            raise RuntimeError(f"head repository of PR #{number} is gone "
+                               "(fork deleted?) — nowhere to push")
         branch, push_repo = pr.head.ref, pr.head.repo.full_name
     else:
         branch = f"overseer/issue-{number}"
@@ -345,6 +363,10 @@ def run_job(gh, config, event):
         sh(["git", "config", "user.name", config["bot_login"]], cwd=tmp)
         sh(["git", "config", "user.email",
             f"{config['bot_login']}@users.noreply.github.com"], cwd=tmp)
+        # drop the token from .git/config: the agent runs in this checkout
+        # with git access; all later fetch/push calls use explicit URLs
+        sh(["git", "remote", "set-url", "origin",
+            f"https://github.com/{repo_name}.git"], cwd=tmp)
         base = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=tmp).strip()
 
         push_url = auth_url(config, push_repo)
@@ -379,7 +401,7 @@ def run_job(gh, config, event):
                        "Reply here to resume from where it stopped.")
 
         # commit anything the agent left uncommitted, then count work
-        subprocess.run(["git", "add", "-A"], cwd=tmp)
+        subprocess.run(["git", "add", "-A"], cwd=tmp, capture_output=True)
         subprocess.run(["git", "commit", "-m", "overseer: uncommitted changes"],
                        cwd=tmp, capture_output=True)
         commits = int(sh(["git", "rev-list", "--count", f"{start_ref}..HEAD"],
@@ -388,53 +410,35 @@ def run_job(gh, config, event):
             report(gh, config, repo_name, number, summary)
             return resume_at
 
-        for attempt in range(3):  # a fresh fork can take a moment to be pushable
-            pushed = subprocess.run(["git", "push", push_url, f"{branch}:{branch}"],
-                                    cwd=tmp, capture_output=True, text=True)
-            if pushed.returncode == 0:
-                bundle.unlink(missing_ok=True)  # work is on the remote now
-                break
-            time.sleep(5 * (attempt + 1))
-        else:
-            # git push failed. If it was a 403 (no write access) and we
-            # weren't already targeting a fork, try creating a fork instead.
-            if "403" in pushed.stderr and push_repo == repo_name:
-                log(f"no push access to {repo_name}; attempting to contribute via fork")
-                try:
-                    push_repo = repo.create_fork().full_name
-                    push_url = auth_url(config, push_repo)
-                    log(f"pushing to fork {push_repo}")
-                    pushed = subprocess.run(
-                        ["git", "push", push_url, f"{branch}:{branch}"],
-                        cwd=tmp, capture_output=True, text=True)
-                    if pushed.returncode == 0:
-                        bundle.unlink(missing_ok=True)
-                        # wire up head for the fork path, then proceed to PR normally
-                        head = f"{push_repo.split('/')[0]}:{branch}"
-                        existing = list(repo.get_pulls(state="open", head=head))
-                        if existing:
-                            report(gh, config, repo_name, number,
-                                   f"pushed {commits} commit(s) to {existing[0].html_url}\n\n{summary}")
-                        elif not event["is_pr"]:
-                            pr = repo.create_pull(
-                                base=base, head=head,
-                                title=f"overseer: {event['target']['title']}"[:100],
-                                body=f"Closes #{number}\n\n{summary}")
-                            report(gh, config, repo_name, number,
-                                   f"opened PR: {pr.html_url}")
-                        log(f"job done: {repo_name}#{number}")
-                        return resume_at
-                except Exception as fork_err:
-                    log(f"fork-and-push failed: {fork_err}")
+        def try_push(url):
+            for attempt in range(3):  # a fresh fork can take a moment to be pushable
+                p = subprocess.run(["git", "push", url, f"{branch}:{branch}"],
+                                   cwd=tmp, capture_output=True, text=True)
+                if p.returncode == 0 or attempt == 2:
+                    return p
+                time.sleep(5 * (attempt + 1))
 
+        pushed = try_push(push_url)
+        if pushed.returncode != 0 and "403" in pushed.stderr and push_repo == repo_name:
+            # no write access after all (revoked mid-job, stale permission
+            # check) — fall back to contributing via a fork
+            log(f"no push access to {repo_name}; attempting to contribute via fork")
+            try:
+                push_repo = repo.create_fork().full_name
+                push_url = auth_url(config, push_repo)
+                log(f"pushing to fork {push_repo}")
+                pushed = try_push(push_url)
+            except Exception as fork_err:
+                log(f"fork-and-push failed: {fork_err}")
+        if pushed.returncode != 0:
             # preserve the commits locally so the next run resumes from them
-            bundle.parent.mkdir(exist_ok=True)
+            bundle.parent.mkdir(parents=True, exist_ok=True)
             sh(["git", "bundle", "create", str(bundle), branch], cwd=tmp)
-            err_msg = pushed.stderr.strip()[:300]
             raise RuntimeError(
-                f"push to {push_repo} failed: {err_msg} — "
+                f"push to {push_repo} failed: {pushed.stderr.strip()[:300]} — "
                 f"work preserved in {bundle.name}; fix access and re-trigger "
                 "with a comment to resume")
+        bundle.unlink(missing_ok=True)  # work is on the remote now
 
         head = f"{push_repo.split('/')[0]}:{branch}"
         existing = list(repo.get_pulls(state="open", head=head))
@@ -447,17 +451,29 @@ def run_job(gh, config, event):
                 title=f"overseer: {event['target']['title']}"[:100],
                 body=f"Closes #{number}\n\n{summary}")
             report(gh, config, repo_name, number, f"opened PR: {pr.html_url}")
+        else:
+            # is_pr job that ended up on a fork branch the PR doesn't use
+            # (e.g. 403 fallback on an owner-authored PR) — say where the work is
+            report(gh, config, repo_name, number,
+                   f"pushed {commits} commit(s) to {push_repo}@{branch}, but no open "
+                   f"PR uses that branch — merge or open a PR manually\n\n{summary}")
     log(f"job done: {repo_name}#{number}")
     return resume_at
 
 
 # ---------------------------------------------------------------- main loop
 
-def queue_retry(state, event, resume_at, attempts):
+def queue_retry(gh, config, state, event, resume_at, attempts):
     """Schedule a usage-limited job to re-run when the limit window resets."""
     repo, number = event["repo"], event["number"]
     if attempts > 5:
         log(f"giving up after {attempts - 1} limit retries: {repo}#{number}")
+        try:  # the thread was promised auto-resume — say we stopped
+            report(gh, config, repo, number,
+                   f"⚠️ giving up after {attempts - 1} usage-limit retries — "
+                   "reply here to try again.")
+        except Exception:
+            pass
         return
     if any(r["event"]["repo"] == repo and r["event"]["number"] == number
            for r in state.get("retries", [])):
@@ -480,7 +496,7 @@ def run_and_maybe_retry(gh, config, state, event, attempts=0):
             pass
         return
     if resume_at:
-        queue_retry(state, event, resume_at, attempts + 1)
+        queue_retry(gh, config, state, event, resume_at, attempts + 1)
 
 
 def cycle(gh, config, state, state_path):
@@ -494,14 +510,15 @@ def cycle(gh, config, state, state_path):
     for r in due:
         run_and_maybe_retry(gh, config, state, r["event"], r["attempts"])
 
-    issues, comments = poll(gh, config, parse_ts(state["last_poll"]))
+    issues, comments, ok = poll(gh, config, parse_ts(state["last_poll"]))
     for event in find_events(config["owner"], config["bot_login"],
                              issues, comments, processed):
         processed.update(event["keys"])
         state["processed"] = sorted(processed)
         state_path.write_text(json.dumps(state, indent=1))
         run_and_maybe_retry(gh, config, state, event)
-    state["last_poll"] = now
+    if ok:  # partial poll failure: keep last_poll so the next poll re-sweeps
+        state["last_poll"] = now
     state_path.write_text(json.dumps(state, indent=1))
 
 
@@ -512,6 +529,8 @@ def main():
     args = ap.parse_args()
     config = json.loads(Path(args.config).read_text())
     config["bot_token"] = config.get("bot_token") or os.environ["GH_BOT_TOKEN"]
+    SECRETS.append(config["bot_token"])
+    SECRETS.extend(v for v in config.get("env", {}).values() if v)
     gh = Github(auth=Auth.Token(config["bot_token"]))
     config["bot_login"] = gh.get_user().login
     state_path = Path(config.get("state_file") or Path(args.config).parent / "state.json")

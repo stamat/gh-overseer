@@ -328,6 +328,10 @@ setup required.
   `--allowed-tools` list (no arbitrary `Bash` by default). Widen it
   (e.g. `Bash(npm test:*)`) deliberately. Never use
   `--dangerously-skip-permissions` here.
+- The PAT is kept away from the agent and the public: it is stripped from the
+  checkout's `.git/config` right after cloning (fetch/push use explicit URLs),
+  and all tokens (PAT + runner `env` values) are redacted from log lines and
+  issue comments, so a git error echoing an authenticated URL can't leak them.
 - PAT choice is a scope trade-off: fine-grained (collaborator mode only) is
   tighter; contribution mode needs a classic PAT, whose reach is the bot
   account's reach — which is still only repos you invited it to plus its own

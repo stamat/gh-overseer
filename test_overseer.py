@@ -6,6 +6,7 @@
 
 import unittest
 
+import overseer
 from overseer import build_prompt, find_events
 
 OWNER, BOT = "stamat", "stamat-bot"
@@ -107,6 +108,17 @@ class TestBuildPrompt(unittest.TestCase):
             {"author": OWNER, "path": "a.py", "line": 3, "body": "rename this"}]), OWNER)
         self.assertIn("PR #1", p)
         self.assertIn("a.py:3: rename this", p)
+
+
+class TestRedact(unittest.TestCase):
+    def test_scrubs_every_registered_secret(self):
+        overseer.SECRETS[:] = ["ghp_secret", "sk-ant-oat-x"]
+        try:
+            self.assertEqual(
+                overseer.redact("push to https://x:ghp_secret@x failed, sk-ant-oat-x"),
+                "push to https://x:***@x failed, ***")
+        finally:
+            overseer.SECRETS.clear()
 
 
 if __name__ == "__main__":
