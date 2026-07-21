@@ -162,16 +162,17 @@ def build_prompt(event, owner, limit=50):
                      + "\n---\n".join(event["directives"]))
     parts.append(
         "Instructions:\n"
-        "- Break the work into subtasks.\n"
+        "- FIRST, review the task and the codebase. If anything is ambiguous or"
+        f" needs a decision from @{owner}, make NO code changes and end with your"
+        " question — it will be posted as a comment. Do not guess.\n"
+        "- Otherwise break the work into subtasks.\n"
         "- Implement each subtask and commit it separately: `subtask: <description>`.\n"
         "- Run the project's tests if present and your tools allow it;"
         " fix any failures you introduced.\n"
         "- Do NOT push; the orchestrator pushes.\n"
-        f"- If you need more information from @{owner}, make NO code changes and"
-        " end with your question — it will be posted as a comment.\n"
-        "- Write your full report — what you did and why, or the full answer if"
-        " a report/analysis was requested — to `.overseer-report.md` in the repo"
-        " root. It is posted back as a comment and never committed."
+        "- Write your report to `.overseer-report.md` in the repo root — short and"
+        " to the point: what you did and why (or the full answer if an analysis was"
+        " requested). It is posted back as a comment and never committed."
     )
     return "\n\n".join(parts)
 
@@ -519,7 +520,8 @@ def run_job(gh, config, event):
 
     log(f"job start: {repo_name}#{number} ({event['kind']})")
     runner = pick_runner(config, event, config["owner"])  # before clone: typo fails fast
-    report(gh, config, repo_name, number, ack_message(config, event))
+    if config.get("ack_start", True):  # start ack optional
+        report(gh, config, repo_name, number, ack_message(config, event))
     with tempfile.TemporaryDirectory() as tmp:
         sh(["git", "clone", "--depth", "50", auth_url(config, repo_name), tmp])
         sh(["git", "config", "user.name", config["bot_login"]], cwd=tmp)
@@ -610,21 +612,24 @@ def run_job(gh, config, event):
                 "with a comment to resume")
         bundle.unlink(missing_ok=True)  # work is on the remote now
 
+        fin = config.get("ack_finish", True)  # finish ack optional
         head = f"{push_repo.split('/')[0]}:{branch}"
         existing = list(repo.get_pulls(state="open", head=head))
         if existing:
-            report(gh, config, repo_name, number,
-                   humanize(config,
-                            f"pushed {commits} commit(s) to {existing[0].html_url}",
-                            keep=(existing[0].html_url,)) + f"\n\n{summary}")
+            head_line = (humanize(config,
+                                  f"pushed {commits} commit(s) to {existing[0].html_url}",
+                                  keep=(existing[0].html_url,))
+                         if fin else existing[0].html_url)
+            report(gh, config, repo_name, number, f"{head_line}\n\n{summary}")
         elif not event["is_pr"]:
             pr = repo.create_pull(
                 base=base, head=head,
                 title=f"overseer: {event['target']['title']}"[:100],
                 body=f"Closes #{number}\n\n{redact(summary)}"[:65536])
-            report(gh, config, repo_name, number,
-                   humanize(config, f"opened PR: {pr.html_url}",
-                            keep=(pr.html_url,)))
+            if fin:  # PR body already carries the summary; comment is just the ack
+                report(gh, config, repo_name, number,
+                       humanize(config, f"opened PR: {pr.html_url}",
+                                keep=(pr.html_url,)))
         else:
             # is_pr job that ended up on a fork branch the PR doesn't use
             # (e.g. 403 fallback on an owner-authored PR) — say where the work is
