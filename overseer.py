@@ -557,9 +557,9 @@ def run_job(gh, config, event, state=None):
         # commit identity: the bot by default, or the owner when impersonating
         # (optional — lets the bot's work land under the owner's name).
         if config.get("impersonate"):
-            name = config.get("commit_name", config["owner"])
-            email = config.get("commit_email",
-                               f"{config['owner']}@users.noreply.github.com")
+            name = config.get("commit_name") or config["owner"]
+            email = (config.get("commit_email")
+                     or f"{config['owner']}@users.noreply.github.com")
         else:
             name = config["bot_login"]
             email = f"{config['bot_login']}@users.noreply.github.com"
