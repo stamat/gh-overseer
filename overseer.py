@@ -498,9 +498,39 @@ def salvage_path(config, repo_name, number):
     return d / f"{repo_name.replace('/', '_')}#{number}.bundle"
 
 
-def run_job(gh, config, event):
+@contextmanager
+def workspace(config, repo_name, number):
+    """The checkout directory for a job.
+
+    Default: a throwaway temp dir (cleaned up after). When `work_root` is set,
+    a stable per-issue dir that survives between runs — Claude keys its session
+    transcripts by the working-directory path, so a stable path is what lets
+    `--resume` pick up the same session on a follow-up.
+    """
+    root = config.get("work_root")
+    if not root:
+        with tempfile.TemporaryDirectory() as tmp:
+            yield tmp
+        return
+    d = Path(root) / f"{repo_name.replace('/', '_')}#{number}"
+    d.mkdir(parents=True, exist_ok=True)
+    yield str(d)  # persistent: intentionally not removed
+
+
+def clone_or_refresh(config, repo_name, tmp):
+    """Fresh clone into an empty dir, or refresh an existing persistent one."""
+    if (Path(tmp) / ".git").exists():
+        # reuse: the checkout persisted from a prior run; just fetch the base
+        sh(["git", "fetch", "--depth", "50", auth_url(config, repo_name),
+            "HEAD"], cwd=tmp)
+    else:
+        sh(["git", "clone", "--depth", "50", auth_url(config, repo_name), tmp])
+
+
+def run_job(gh, config, event, state=None):
     repo_name, number = event["repo"], event["number"]
     repo = gh.get_repo(repo_name)
+    state = state if state is not None else {}
 
     # where does the branch live? direct push if collaborator, else a fork
     # (create_fork is idempotent — returns the existing fork if there is one)
@@ -522,8 +552,8 @@ def run_job(gh, config, event):
     runner = pick_runner(config, event, config["owner"])  # before clone: typo fails fast
     if config.get("ack_start", True):  # start ack optional
         report(gh, config, repo_name, number, ack_message(config, event))
-    with tempfile.TemporaryDirectory() as tmp:
-        sh(["git", "clone", "--depth", "50", auth_url(config, repo_name), tmp])
+    with workspace(config, repo_name, number) as tmp:
+        clone_or_refresh(config, repo_name, tmp)
         # commit identity: the bot by default, or the owner when impersonating
         # (optional — lets the bot's work land under the owner's name).
         if config.get("impersonate"):
@@ -539,7 +569,7 @@ def run_job(gh, config, event):
         # with git access; all later fetch/push calls use explicit URLs
         sh(["git", "remote", "set-url", "origin",
             f"https://github.com/{repo_name}.git"], cwd=tmp)
-        base = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=tmp).strip()
+        base = repo.default_branch  # reuse-safe: independent of current HEAD
 
         push_url = auth_url(config, push_repo)
         bundle = salvage_path(config, repo_name, number)
@@ -554,15 +584,35 @@ def run_job(gh, config, event):
             restored = True
             log(f"restored salvaged work from {bundle}")
         else:
-            sh(["git", "checkout", "-b", branch], cwd=tmp)
+            sh(["git", "checkout", "-B", branch], cwd=tmp)
         start_ref = sh(["git", "rev-parse", "HEAD"], cwd=tmp).strip()
 
+        # per-issue Claude session: resume the same conversation on follow-ups.
+        # Only with a persistent work_root (stable cwd) and a claude runner.
+        session_id, resume, skey = None, False, f"{repo_name}#{number}"
+        if config.get("work_root") and runner and runner[0] == "claude":
+            sessions = state.setdefault("sessions", {})
+            session_id = sessions.get(skey)
+            resume = session_id is not None
+            if not session_id:
+                session_id = sessions[skey] = str(uuid.uuid4())
+
+        prompt = build_prompt(event, config["owner"], config.get("context_limit", 50))
         resume_at = None
         report_md = Path(tmp) / ".overseer-report.md"
         try:
-            summary, usage = run_agent(config, build_prompt(event, config["owner"],
-                                                            config.get("context_limit", 50)),
-                                       tmp, runner)
+            try:
+                summary, usage = run_agent(config, prompt, tmp, runner,
+                                           session_id=session_id, resume=resume)
+            except RuntimeError as e:
+                # stale/missing session transcript — start a fresh one and retry
+                if not (resume and re.search(r"(conversation|session).*(found|exist)",
+                                             str(e), re.I)):
+                    raise
+                log("session resume failed; starting a fresh session")
+                session_id = state["sessions"][skey] = str(uuid.uuid4())
+                summary, usage = run_agent(config, prompt, tmp, runner,
+                                           session_id=session_id, resume=False)
             if report_md.exists():  # full report beats truncated stdout
                 summary = report_md.read_text().strip() or summary
             summary += usage
@@ -674,7 +724,7 @@ def queue_retry(gh, config, state, event, resume_at, attempts):
 
 def run_and_maybe_retry(gh, config, state, event, attempts=0):
     try:
-        resume_at = run_job(gh, config, enrich(gh, event))
+        resume_at = run_job(gh, config, enrich(gh, event), state)
     except Exception as e:
         log(f"job failed: {event['repo']}#{event['number']}: {e}")
         try:
