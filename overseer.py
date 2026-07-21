@@ -21,14 +21,20 @@ import re
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 from github import Auth, Github
 
 MARKER = "🤖 [gh-overseer]"
+
+LOG_FILE = None   # set from config in main(); tees log() to disk when set
+VERBOSE = False   # --verbose: stream the agent's live output into the log
 
 ACKS = [
     "On it — taking a look now. 🤖",
@@ -55,8 +61,14 @@ DEFAULT_RUNNER = ["claude", "-p", "{prompt}",
 
 
 def log(msg):
-    print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} "
-          f"{redact(str(msg))}", flush=True)
+    line = f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {redact(str(msg))}"
+    print(line, flush=True)
+    if LOG_FILE:  # local log preserved across restarts; never fatal if it fails
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
 
 def utcnow():
