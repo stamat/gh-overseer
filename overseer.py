@@ -414,20 +414,50 @@ def usage_line(data):
             + f"{u.get('output_tokens', 0):,} out`")
 
 
-def run_agent(config, prompt, cwd, runner=None):
+def _drain(proc, timeout):
+    """Read both pipes concurrently, echoing stderr live to the log (VERBOSE
+    insight into what the agent is doing). Returns (stdout, stderr)."""
+    out, err = [], []
+
+    def pump(pipe, sink, echo):
+        for line in pipe:
+            sink.append(line)
+            if echo:
+                log("agent│ " + line.rstrip())
+
+    ts = [threading.Thread(target=pump, args=(proc.stdout, out, False)),
+          threading.Thread(target=pump, args=(proc.stderr, err, True))]
+    for t in ts:
+        t.start()
+    proc.wait(timeout=timeout)  # raises TimeoutExpired, handled by caller
+    for t in ts:
+        t.join()
+    return "".join(out), "".join(err)
+
+
+def run_agent(config, prompt, cwd, runner=None, session_id=None, resume=False):
     runner = runner or config.get("runner", DEFAULT_RUNNER)
     allowed = config.get("allowed_tools", "Read,Edit,Write,Grep,Glob,Bash(git:*)")
+    if config.get("allow_web"):  # optional webfetch, off by default
+        allowed += ",WebFetch"
     cmd = [a.replace("{prompt}", prompt).replace("{allowed_tools}", allowed)
            for a in runner]
+    if session_id:  # per-issue Claude session (claude-family runners only)
+        cmd += ["--resume", session_id] if resume else ["--session-id", session_id]
     env = {**os.environ, **{k: v for k, v in config.get("env", {}).items() if v}}
     timeout = config.get("job_timeout", 3600)
+    if VERBOSE:
+        log("running: " + " ".join(cmd[:2]) + f" … ({len(cmd)} args)")
     # new session = own process group, so a timeout kills the agent AND
     # everything it spawned (tool calls, test runs), not just the top process
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        if VERBOSE:
+            stdout, stderr = _drain(proc, timeout)
+        else:
+            stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
@@ -670,8 +700,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", default=str(Path(__file__).parent / "config.json"))
     ap.add_argument("--once", action="store_true", help="single poll cycle, then exit")
+    ap.add_argument("--verbose", action="store_true",
+                    help="stream the agent's live output into the log")
     args = ap.parse_args()
     config = json.loads(Path(args.config).read_text())
+    global LOG_FILE, VERBOSE
+    LOG_FILE = config.get("log_file")
+    VERBOSE = args.verbose or config.get("verbose", False)
     config["bot_token"] = config.get("bot_token") or os.environ["GH_BOT_TOKEN"]
     SECRETS.append(config["bot_token"])
     SECRETS.extend(v for v in config.get("env", {}).values() if v)
