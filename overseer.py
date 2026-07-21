@@ -524,9 +524,17 @@ def run_job(gh, config, event):
         report(gh, config, repo_name, number, ack_message(config, event))
     with tempfile.TemporaryDirectory() as tmp:
         sh(["git", "clone", "--depth", "50", auth_url(config, repo_name), tmp])
-        sh(["git", "config", "user.name", config["bot_login"]], cwd=tmp)
-        sh(["git", "config", "user.email",
-            f"{config['bot_login']}@users.noreply.github.com"], cwd=tmp)
+        # commit identity: the bot by default, or the owner when impersonating
+        # (optional — lets the bot's work land under the owner's name).
+        if config.get("impersonate"):
+            name = config.get("commit_name", config["owner"])
+            email = config.get("commit_email",
+                               f"{config['owner']}@users.noreply.github.com")
+        else:
+            name = config["bot_login"]
+            email = f"{config['bot_login']}@users.noreply.github.com"
+        sh(["git", "config", "user.name", name], cwd=tmp)
+        sh(["git", "config", "user.email", email], cwd=tmp)
         # drop the token from .git/config: the agent runs in this checkout
         # with git access; all later fetch/push calls use explicit URLs
         sh(["git", "remote", "set-url", "origin",
