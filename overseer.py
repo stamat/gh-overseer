@@ -21,14 +21,20 @@ import re
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.request
+import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 from github import Auth, Github
 
 MARKER = "🤖 [gh-overseer]"
+
+LOG_FILE = None   # set from config in main(); tees log() to disk when set
+VERBOSE = False   # --verbose: stream the agent's live output into the log
 
 ACKS = [
     "On it — taking a look now. 🤖",
@@ -55,8 +61,14 @@ DEFAULT_RUNNER = ["claude", "-p", "{prompt}",
 
 
 def log(msg):
-    print(f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} "
-          f"{redact(str(msg))}", flush=True)
+    line = f"{datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')} {redact(str(msg))}"
+    print(line, flush=True)
+    if LOG_FILE:  # local log preserved across restarts; never fatal if it fails
+        try:
+            with open(LOG_FILE, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
 
 def utcnow():
@@ -150,16 +162,17 @@ def build_prompt(event, owner, limit=50):
                      + "\n---\n".join(event["directives"]))
     parts.append(
         "Instructions:\n"
-        "- Break the work into subtasks.\n"
+        "- FIRST, review the task and the codebase. If anything is ambiguous or"
+        f" needs a decision from @{owner}, make NO code changes and end with your"
+        " question — it will be posted as a comment. Do not guess.\n"
+        "- Otherwise break the work into subtasks.\n"
         "- Implement each subtask and commit it separately: `subtask: <description>`.\n"
         "- Run the project's tests if present and your tools allow it;"
         " fix any failures you introduced.\n"
         "- Do NOT push; the orchestrator pushes.\n"
-        f"- If you need more information from @{owner}, make NO code changes and"
-        " end with your question — it will be posted as a comment.\n"
-        "- Write your full report — what you did and why, or the full answer if"
-        " a report/analysis was requested — to `.overseer-report.md` in the repo"
-        " root. It is posted back as a comment and never committed."
+        "- Write your report to `.overseer-report.md` in the repo root — short and"
+        " to the point: what you did and why (or the full answer if an analysis was"
+        " requested). It is posted back as a comment and never committed."
     )
     return "\n\n".join(parts)
 
@@ -402,20 +415,50 @@ def usage_line(data):
             + f"{u.get('output_tokens', 0):,} out`")
 
 
-def run_agent(config, prompt, cwd, runner=None):
+def _drain(proc, timeout):
+    """Read both pipes concurrently, echoing stderr live to the log (VERBOSE
+    insight into what the agent is doing). Returns (stdout, stderr)."""
+    out, err = [], []
+
+    def pump(pipe, sink, echo):
+        for line in pipe:
+            sink.append(line)
+            if echo:
+                log("agent│ " + line.rstrip())
+
+    ts = [threading.Thread(target=pump, args=(proc.stdout, out, False)),
+          threading.Thread(target=pump, args=(proc.stderr, err, True))]
+    for t in ts:
+        t.start()
+    proc.wait(timeout=timeout)  # raises TimeoutExpired, handled by caller
+    for t in ts:
+        t.join()
+    return "".join(out), "".join(err)
+
+
+def run_agent(config, prompt, cwd, runner=None, session_id=None, resume=False):
     runner = runner or config.get("runner", DEFAULT_RUNNER)
     allowed = config.get("allowed_tools", "Read,Edit,Write,Grep,Glob,Bash(git:*)")
+    if config.get("allow_web"):  # optional webfetch, off by default
+        allowed += ",WebFetch"
     cmd = [a.replace("{prompt}", prompt).replace("{allowed_tools}", allowed)
            for a in runner]
+    if session_id:  # per-issue Claude session (claude-family runners only)
+        cmd += ["--resume", session_id] if resume else ["--session-id", session_id]
     env = {**os.environ, **{k: v for k, v in config.get("env", {}).items() if v}}
     timeout = config.get("job_timeout", 3600)
+    if VERBOSE:
+        log("running: " + " ".join(cmd[:2]) + f" … ({len(cmd)} args)")
     # new session = own process group, so a timeout kills the agent AND
     # everything it spawned (tool calls, test runs), not just the top process
     proc = subprocess.Popen(cmd, cwd=cwd, env=env, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                             start_new_session=True)
     try:
-        stdout, stderr = proc.communicate(timeout=timeout)
+        if VERBOSE:
+            stdout, stderr = _drain(proc, timeout)
+        else:
+            stdout, stderr = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
         os.killpg(proc.pid, signal.SIGKILL)
         proc.wait()
@@ -455,9 +498,39 @@ def salvage_path(config, repo_name, number):
     return d / f"{repo_name.replace('/', '_')}#{number}.bundle"
 
 
-def run_job(gh, config, event):
+@contextmanager
+def workspace(config, repo_name, number):
+    """The checkout directory for a job.
+
+    Default: a throwaway temp dir (cleaned up after). When `work_root` is set,
+    a stable per-issue dir that survives between runs — Claude keys its session
+    transcripts by the working-directory path, so a stable path is what lets
+    `--resume` pick up the same session on a follow-up.
+    """
+    root = config.get("work_root")
+    if not root:
+        with tempfile.TemporaryDirectory() as tmp:
+            yield tmp
+        return
+    d = Path(root) / f"{repo_name.replace('/', '_')}#{number}"
+    d.mkdir(parents=True, exist_ok=True)
+    yield str(d)  # persistent: intentionally not removed
+
+
+def clone_or_refresh(config, repo_name, tmp):
+    """Fresh clone into an empty dir, or refresh an existing persistent one."""
+    if (Path(tmp) / ".git").exists():
+        # reuse: the checkout persisted from a prior run; just fetch the base
+        sh(["git", "fetch", "--depth", "50", auth_url(config, repo_name),
+            "HEAD"], cwd=tmp)
+    else:
+        sh(["git", "clone", "--depth", "50", auth_url(config, repo_name), tmp])
+
+
+def run_job(gh, config, event, state=None):
     repo_name, number = event["repo"], event["number"]
     repo = gh.get_repo(repo_name)
+    state = state if state is not None else {}
 
     # where does the branch live? direct push if collaborator, else a fork
     # (create_fork is idempotent — returns the existing fork if there is one)
@@ -477,17 +550,26 @@ def run_job(gh, config, event):
 
     log(f"job start: {repo_name}#{number} ({event['kind']})")
     runner = pick_runner(config, event, config["owner"])  # before clone: typo fails fast
-    report(gh, config, repo_name, number, ack_message(config, event))
-    with tempfile.TemporaryDirectory() as tmp:
-        sh(["git", "clone", "--depth", "50", auth_url(config, repo_name), tmp])
-        sh(["git", "config", "user.name", config["bot_login"]], cwd=tmp)
-        sh(["git", "config", "user.email",
-            f"{config['bot_login']}@users.noreply.github.com"], cwd=tmp)
+    if config.get("ack_start", True):  # start ack optional
+        report(gh, config, repo_name, number, ack_message(config, event))
+    with workspace(config, repo_name, number) as tmp:
+        clone_or_refresh(config, repo_name, tmp)
+        # commit identity: the bot by default, or the owner when impersonating
+        # (optional — lets the bot's work land under the owner's name).
+        if config.get("impersonate"):
+            name = config.get("commit_name") or config["owner"]
+            email = (config.get("commit_email")
+                     or f"{config['owner']}@users.noreply.github.com")
+        else:
+            name = config["bot_login"]
+            email = f"{config['bot_login']}@users.noreply.github.com"
+        sh(["git", "config", "user.name", name], cwd=tmp)
+        sh(["git", "config", "user.email", email], cwd=tmp)
         # drop the token from .git/config: the agent runs in this checkout
         # with git access; all later fetch/push calls use explicit URLs
         sh(["git", "remote", "set-url", "origin",
             f"https://github.com/{repo_name}.git"], cwd=tmp)
-        base = sh(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=tmp).strip()
+        base = repo.default_branch  # reuse-safe: independent of current HEAD
 
         push_url = auth_url(config, push_repo)
         bundle = salvage_path(config, repo_name, number)
@@ -502,15 +584,35 @@ def run_job(gh, config, event):
             restored = True
             log(f"restored salvaged work from {bundle}")
         else:
-            sh(["git", "checkout", "-b", branch], cwd=tmp)
+            sh(["git", "checkout", "-B", branch], cwd=tmp)
         start_ref = sh(["git", "rev-parse", "HEAD"], cwd=tmp).strip()
 
+        # per-issue Claude session: resume the same conversation on follow-ups.
+        # Only with a persistent work_root (stable cwd) and a claude runner.
+        session_id, resume, skey = None, False, f"{repo_name}#{number}"
+        if config.get("work_root") and runner and runner[0] == "claude":
+            sessions = state.setdefault("sessions", {})
+            session_id = sessions.get(skey)
+            resume = session_id is not None
+            if not session_id:
+                session_id = sessions[skey] = str(uuid.uuid4())
+
+        prompt = build_prompt(event, config["owner"], config.get("context_limit", 50))
         resume_at = None
         report_md = Path(tmp) / ".overseer-report.md"
         try:
-            summary, usage = run_agent(config, build_prompt(event, config["owner"],
-                                                            config.get("context_limit", 50)),
-                                       tmp, runner)
+            try:
+                summary, usage = run_agent(config, prompt, tmp, runner,
+                                           session_id=session_id, resume=resume)
+            except RuntimeError as e:
+                # stale/missing session transcript — start a fresh one and retry
+                if not (resume and re.search(r"(conversation|session).*(found|exist)",
+                                             str(e), re.I)):
+                    raise
+                log("session resume failed; starting a fresh session")
+                session_id = state["sessions"][skey] = str(uuid.uuid4())
+                summary, usage = run_agent(config, prompt, tmp, runner,
+                                           session_id=session_id, resume=False)
             if report_md.exists():  # full report beats truncated stdout
                 summary = report_md.read_text().strip() or summary
             summary += usage
@@ -568,21 +670,24 @@ def run_job(gh, config, event):
                 "with a comment to resume")
         bundle.unlink(missing_ok=True)  # work is on the remote now
 
+        fin = config.get("ack_finish", True)  # finish ack optional
         head = f"{push_repo.split('/')[0]}:{branch}"
         existing = list(repo.get_pulls(state="open", head=head))
         if existing:
-            report(gh, config, repo_name, number,
-                   humanize(config,
-                            f"pushed {commits} commit(s) to {existing[0].html_url}",
-                            keep=(existing[0].html_url,)) + f"\n\n{summary}")
+            head_line = (humanize(config,
+                                  f"pushed {commits} commit(s) to {existing[0].html_url}",
+                                  keep=(existing[0].html_url,))
+                         if fin else existing[0].html_url)
+            report(gh, config, repo_name, number, f"{head_line}\n\n{summary}")
         elif not event["is_pr"]:
             pr = repo.create_pull(
                 base=base, head=head,
                 title=f"overseer: {event['target']['title']}"[:100],
                 body=f"Closes #{number}\n\n{redact(summary)}"[:65536])
-            report(gh, config, repo_name, number,
-                   humanize(config, f"opened PR: {pr.html_url}",
-                            keep=(pr.html_url,)))
+            if fin:  # PR body already carries the summary; comment is just the ack
+                report(gh, config, repo_name, number,
+                       humanize(config, f"opened PR: {pr.html_url}",
+                                keep=(pr.html_url,)))
         else:
             # is_pr job that ended up on a fork branch the PR doesn't use
             # (e.g. 403 fallback on an owner-authored PR) — say where the work is
@@ -619,7 +724,7 @@ def queue_retry(gh, config, state, event, resume_at, attempts):
 
 def run_and_maybe_retry(gh, config, state, event, attempts=0):
     try:
-        resume_at = run_job(gh, config, enrich(gh, event))
+        resume_at = run_job(gh, config, enrich(gh, event), state)
     except Exception as e:
         log(f"job failed: {event['repo']}#{event['number']}: {e}")
         try:
@@ -658,8 +763,13 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--config", default=str(Path(__file__).parent / "config.json"))
     ap.add_argument("--once", action="store_true", help="single poll cycle, then exit")
+    ap.add_argument("--verbose", action="store_true",
+                    help="stream the agent's live output into the log")
     args = ap.parse_args()
     config = json.loads(Path(args.config).read_text())
+    global LOG_FILE, VERBOSE
+    LOG_FILE = config.get("log_file")
+    VERBOSE = args.verbose or config.get("verbose", False)
     config["bot_token"] = config.get("bot_token") or os.environ["GH_BOT_TOKEN"]
     SECRETS.append(config["bot_token"])
     SECRETS.extend(v for v in config.get("env", {}).values() if v)
